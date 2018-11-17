@@ -11,6 +11,10 @@ Input:
 
 import pandas as pd
 import pathlib
+import subprocess
+import collections
+import multiprocessing
+from functools import partial
 
 
 def _read_bed(file_path):
@@ -42,7 +46,7 @@ def _query_genome(fasta_path, fai_df,
     # calculate length
     seq_start_pos = fai_df.loc[seq_name, 'start_at']
     # in case the region start is close to ref sequence start
-    chrom_query_start = max(0, seq_start_pos - left_expand)
+    chrom_query_start = max(0, seq_start_pos + region_start - left_expand)
     if chrom_query_start == 0:
         real_left_expand = seq_start_pos
     else:
@@ -78,15 +82,123 @@ def _query_genome(fasta_path, fai_df,
 
     query_result = pd.Series({  # following primer3 tag names
         'SEQUENCE_NAME': primer_name,
-        'SEQUENCE_TEMPLATE': query_sequence,
+        'SEQUENCE_TEMPLATE': query_sequence.upper(),
         'SEQUENCE_TARGET': f'{real_left_expand},{region_end - region_start}'
     })
     return query_result
 
 
-def prepare_primer3(bed_path, fasta_path, primer3_config,
-                    left_expand=None, right_expand=None, both_expand=100,
-                    max_length=99999, drop_too_long=False):
+def _run_primer3(primer_template_df, setting_dict, cpu):
+    pool = multiprocessing.Pool(cpu)
+    primer3_runner = partial(subprocess.run,
+                             args=['primer3_core'],
+                             stdout=subprocess.PIPE,
+                             encoding='utf8',
+                             check=False)
+    results = []
+    for primer_name, record in primer_template_df.iterrows():
+        # modify setting_dict, prepare primer specific input
+        row_input_dict = setting_dict.copy()
+        for k, v in record.iteritems():
+            if k != '':
+                row_input_dict[k] = v
+        row_input_dict['SEQUENCE_NAME'] = primer_name
+        primer3_input = ''
+
+        for k, v in row_input_dict.items():
+            if k != '':
+                primer3_input += f'{k}={v}\n'
+        primer3_input += '=\n'
+        # run
+        result = pool.apply_async(primer3_runner,
+                                  kwds=dict(input=primer3_input))
+        results.append(result)
+    pool.close()
+    pool.join()
+
+    primer_stats = []
+    primers = []
+    for result in results:
+        primer3_return = result.get()
+        if primer3_return.returncode != 0:
+            print(primer3_return)
+            return
+
+        primer3_out = primer3_return.stdout
+        primer_stat_df, primer_df = _parse_primer3_result(primer3_out)
+        primer_stats.append(primer_stat_df)
+        primers.append(primer_df)
+    total_primer_stat_df = pd.concat(primer_stats, sort=True)
+    total_primer_df = pd.concat(primers, sort=True)
+
+    return primer_template_df, total_primer_stat_df, total_primer_df
+
+
+def _parse_primer3_result(primer3_out):
+    # split stat part and primer part
+    stat_dict = {}
+    primer_dict = {}
+    primer_info_start = False
+    for line in primer3_out.split('\n'):
+        ll = line.strip().split('=')
+        if len(ll) != 2:
+            continue
+        if primer_info_start:
+            primer_dict[ll[0]] = ll[1]
+        else:
+            if ll[0].startswith('PRIMER_PAIR_0'):
+                primer_info_start = True
+                primer_dict[ll[0]] = ll[1]
+            else:
+                stat_dict[ll[0]] = ll[1]
+
+    # get primer stat df
+    primer_stat_records = []
+    primer_stat_dict = {}
+    for condition in stat_dict['PRIMER_LEFT_EXPLAIN'].split(','):
+        *condition_name, value = condition.strip().split(' ')
+        condition_name = '_'.join(condition_name)
+        primer_stat_dict[condition_name] = value
+    primer_stat_dict['primer_type'] = 'left'
+    primer_stat_records.append(pd.Series(primer_stat_dict))
+    primer_stat_dict = {}
+    for condition in stat_dict['PRIMER_RIGHT_EXPLAIN'].split(','):
+        *condition_name, value = condition.strip().split(' ')
+        condition_name = '_'.join(condition_name)
+        primer_stat_dict[condition_name] = value
+    primer_stat_dict['primer_type'] = 'right'
+    primer_stat_records.append(pd.Series(primer_stat_dict))
+    primer_stat_df = pd.DataFrame(primer_stat_records)
+    primer_stat_df['primer_name'] = stat_dict['SEQUENCE_NAME']
+
+    # get primer df
+    primer_record_dict = collections.defaultdict(dict)
+    for k, v in primer_dict.items():
+        kl = k.split('_')
+        if len(kl) < 4:
+            continue
+        primer_id = f"{stat_dict['SEQUENCE_NAME']}_{kl[2]}"
+        item_name = '_'.join(kl[:2] + kl[3:])
+        primer_record_dict[primer_id][item_name] = v
+    primer_df = pd.DataFrame(primer_record_dict).T
+    primer_df['primer_name'] = stat_dict['SEQUENCE_NAME']
+    return primer_stat_df, primer_df
+
+
+def primer3(bed_path, fasta_path, primer3_setting_path,
+            left_expand=None, right_expand=None, both_expand=100,
+            max_length=99999, drop_too_long=False, cpu=10, **config_kws):
+    # parse config
+    setting_dict = {}
+    with open(primer3_setting_path) as f:
+        for line in f:
+            ll = line.strip().split('=')
+            if (len(ll) != 2) or (ll[0] == 'P3_FILE_TYPE'):
+                continue
+            setting_dict[ll[0]] = ll[1]
+    for k, v in config_kws.items():
+        setting_dict[k.upper()] = v
+
     # all the number within primer3 config are not carefully checked, remain this to primer3.
     if left_expand is None:
         left_expand = both_expand
@@ -96,9 +208,9 @@ def prepare_primer3(bed_path, fasta_path, primer3_config,
         raise ValueError('Specify left_expand & right_expand, or both_expand')
 
     bed_df = _read_bed(bed_path)
-    if not pathlib.Path(fasta_path+'.fai').exists():
+    if not pathlib.Path(fasta_path + '.fai').exists():
         raise FileNotFoundError(f'{fasta_path} do not have .fai index, use samtools faidx to index the file first')
-    fai_df = _read_fasta_fai(fasta_path+'.fai')
+    fai_df = _read_fasta_fai(fasta_path + '.fai')
 
     primer_records = []
     for primer_name, (seq_name, start, end) in bed_df.iterrows():
@@ -127,5 +239,6 @@ def prepare_primer3(bed_path, fasta_path, primer3_config,
                                       primer_name=primer_name)
         primer_records.append(primer_series)
     primer_template_df = pd.DataFrame(primer_records).set_index('SEQUENCE_NAME')
-
-    # TODO run primer3_core for each row, parse output
+    primer_template_df, total_primer_stat_df, total_primer_df = _run_primer3(primer_template_df,
+                                                                             setting_dict, cpu=cpu)
+    return primer_template_df, total_primer_stat_df, total_primer_df
