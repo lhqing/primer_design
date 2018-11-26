@@ -15,6 +15,8 @@ import subprocess
 import collections
 import multiprocessing
 from functools import partial
+from Bio.Blast.Applications import NcbiblastnCommandline
+from Bio import SearchIO
 
 
 def _read_bed(file_path):
@@ -169,7 +171,7 @@ def _parse_primer3_result(primer3_out):
     primer_stat_dict['primer_type'] = 'right'
     primer_stat_records.append(pd.Series(primer_stat_dict))
     primer_stat_df = pd.DataFrame(primer_stat_records)
-    primer_stat_df['primer_name'] = stat_dict['SEQUENCE_NAME']
+    primer_stat_df['PRIMER_NAME'] = stat_dict['SEQUENCE_NAME']
 
     # get primer df
     primer_record_dict = collections.defaultdict(dict)
@@ -181,13 +183,16 @@ def _parse_primer3_result(primer3_out):
         item_name = '_'.join(kl[:2] + kl[3:])
         primer_record_dict[primer_id][item_name] = v
     primer_df = pd.DataFrame(primer_record_dict).T
-    primer_df['primer_name'] = stat_dict['SEQUENCE_NAME']
+    primer_df['PRIMER_NAME'] = stat_dict['SEQUENCE_NAME']
     return primer_stat_df, primer_df
 
 
-def primer3(bed_path, fasta_path, primer3_setting_path,
-            left_expand=None, right_expand=None, both_expand=100,
-            max_length=99999, drop_too_long=False, cpu=10, **config_kws):
+def primer_blast(bed_path, target_fasta_path, primer3_setting_path, blast_db_path,
+                 left_expand=None, right_expand=None, both_expand=100,
+                 max_length=99999, drop_too_long=False, cpu=10, blast_kws=None,
+                 **config_kws):
+    out_dir = pathlib.Path(bed_path).parent
+
     # parse config
     setting_dict = {}
     with open(primer3_setting_path) as f:
@@ -208,9 +213,10 @@ def primer3(bed_path, fasta_path, primer3_setting_path,
         raise ValueError('Specify left_expand & right_expand, or both_expand')
 
     bed_df = _read_bed(bed_path)
-    if not pathlib.Path(fasta_path + '.fai').exists():
-        raise FileNotFoundError(f'{fasta_path} do not have .fai index, use samtools faidx to index the file first')
-    fai_df = _read_fasta_fai(fasta_path + '.fai')
+    if not pathlib.Path(target_fasta_path + '.fai').exists():
+        raise FileNotFoundError(
+            f'{target_fasta_path} do not have .fai index, use samtools faidx to index the file first')
+    fai_df = _read_fasta_fai(target_fasta_path + '.fai')
 
     primer_records = []
     for primer_name, (seq_name, start, end) in bed_df.iterrows():
@@ -229,7 +235,7 @@ def primer3(bed_path, fasta_path, primer3_setting_path,
             left_expand = int(extra_length * left_portion)
             right_expand = extra_length - left_expand
 
-        primer_series = _query_genome(fasta_path=fasta_path,
+        primer_series = _query_genome(fasta_path=target_fasta_path,
                                       fai_df=fai_df,
                                       seq_name=seq_name,
                                       region_start=start,
@@ -241,4 +247,123 @@ def primer3(bed_path, fasta_path, primer3_setting_path,
     primer_template_df = pd.DataFrame(primer_records).set_index('SEQUENCE_NAME')
     primer_template_df, total_primer_stat_df, total_primer_df = _run_primer3(primer_template_df,
                                                                              setting_dict, cpu=cpu)
+
+    dump_primer_fasta(total_primer_df, out_dir / 'primer.fa')
+
+    if blast_kws is None:
+        blast_kws = {}
+    primer_hit_df = blast_primer(primer_fasta_path=out_dir / 'primer.fa',
+                                 db_path=blast_db_path,
+                                 **blast_kws)
+    total_primer_df = pd.concat([total_primer_df, primer_hit_df], axis=1, sort=True)
+    total_primer_df = total_primer_df.reindex(primer_hit_df.index)
+
+    primer_template_df.to_csv(out_dir / 'primer_template.tsv.gz', sep='\t', compression='gzip')
+    total_primer_stat_df.to_csv(out_dir / 'primer3_stat.tsv.gz', sep='\t', compression='gzip')
+    total_primer_df.to_csv(out_dir / 'primer.tsv.gz', sep='\t', compression='gzip')
+
     return primer_template_df, total_primer_stat_df, total_primer_df
+
+
+def dump_primer_fasta(total_primer_df, out_path):
+    primer_fasta = ''
+    for primer_id, sequence in total_primer_df['PRIMER_RIGHT_SEQUENCE'].iteritems():
+        fasta_record = f'>{primer_id}_r\n{sequence}\n'
+        primer_fasta += fasta_record
+    for primer_id, sequence in total_primer_df['PRIMER_LEFT_SEQUENCE'].iteritems():
+        fasta_record = f'>{primer_id}_l\n{sequence}\n'
+        primer_fasta += fasta_record
+    with open(out_path, 'w') as f:
+        f.write(primer_fasta)
+
+
+def blast_primer(primer_fasta_path,
+                 db_path,
+                 evalue_cutoff=1,
+                 min_total_mismatch_portion=0.2,
+                 min_total_mismatch=6,
+                 min_prime_3_mismatch=2,
+                 prime_3_length=5,
+                 alt_pos_cutoff=15):
+    """
+    Take a fasta file as input, query genome db and count qualified hits
+    :param alt_pos_cutoff:
+    :param primer_fasta_path:
+    :param db_path:
+    :param evalue_cutoff:
+    :param min_total_mismatch_portion:
+    :param min_total_mismatch:
+    :param min_prime_3_mismatch:
+    :param prime_3_length:
+    :return:
+    """
+    # run blastn for all primers
+    temp_dir = pathlib.Path(primer_fasta_path).parent
+
+    blast_cline = NcbiblastnCommandline(query=str(primer_fasta_path),
+                                        db=db_path,
+                                        evalue=evalue_cutoff,
+                                        outfmt=5,
+                                        out=str(temp_dir / "primer_blast_result.xml"),
+                                        task='blastn')
+    blast_cline()
+
+    # parse blast result
+    blast_results = SearchIO.parse(temp_dir / "primer_blast_result.xml", "blast-xml")
+    primer_hit_dict = {}
+    for blast_result in blast_results:
+        primer_length = blast_result.seq_len
+        primer_total_mismatch = max(min_total_mismatch, min_total_mismatch_portion * primer_length)
+        alternate_hsps = []
+        for hit in blast_result:
+            for hsp in hit.hsps:
+                prime_5_unmatch = [' ' for _ in range(hsp.query_range[0])]
+                prime_3_unmatch = [' ' for _ in range(primer_length - hsp.query_range[1])]
+                align_anno = prime_5_unmatch + list(hsp.aln_annotation['similarity']) + prime_3_unmatch
+                align_anno = ''.join(align_anno)
+
+                total_mismatch = primer_length - align_anno.count('|')
+                if total_mismatch > primer_total_mismatch:
+                    continue
+
+                prime_3_mismatch = prime_3_length - align_anno[-prime_3_length:].count('|')
+                if prime_3_mismatch > min_prime_3_mismatch:
+                    continue
+                alternate_hsps.append(hsp)
+        *primer_name, direction = blast_result.id.split('_')
+        primer_name = '_'.join(primer_name)
+        append_pos = 0 if direction == 'l' else 1
+        if primer_name not in primer_hit_dict:
+            primer_hit_dict[primer_name] = [[], []]
+        primer_hit_dict[primer_name][append_pos] += alternate_hsps
+
+    primer_hit_records = {}
+    for primer, (left_hits, right_hits) in primer_hit_dict.items():
+        if (len(left_hits) > alt_pos_cutoff) or (len(right_hits) > alt_pos_cutoff):
+            continue
+        else:
+            valid_product_lengths = []
+            for left_hit in left_hits:
+                for right_hit in right_hits:
+                    # hit not in same chrom
+                    if left_hit.hit_id != right_hit.hit_id:
+                        continue
+                    # left right hit on same strand
+                    elif left_hit.hit_strand * right_hit.hit_strand > 0:
+                        continue
+                    else:
+                        product_size = abs(left_hit.hit_range[0] - right_hit.hit_range[1])
+                        # left right too far away
+                        if product_size > 50000:
+                            continue
+
+                    valid_product_lengths.append(str(product_size))
+            primer_hit_records[primer] = {
+                'LEFT_GENOME_HITS': len(left_hits),
+                'RIGHT_GENOME_HITS': len(right_hits),
+                'POTENTIAL_PRODUCTS': len(valid_product_lengths),
+                'POTENTIAL_PRODUCT_LENGTHS': '|'.join(valid_product_lengths),
+            }
+    primer_hit_df = pd.DataFrame(primer_hit_records).T
+
+    return primer_hit_df
