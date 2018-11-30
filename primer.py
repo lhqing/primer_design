@@ -1,3 +1,4 @@
+# %load /home/hanliu/pkg/primer_design/primer.py
 """
 Author Hanqing Liu
 
@@ -13,8 +14,6 @@ import pandas as pd
 import pathlib
 import subprocess
 import collections
-import multiprocessing
-from functools import partial
 from Bio.Blast.Applications import NcbiblastnCommandline
 from Bio import SearchIO
 
@@ -95,13 +94,7 @@ def _query_genome(fasta_path, fai_df,
     return query_result
 
 
-def _run_primer3(primer_template_df, setting_dict, cpu):
-    pool = multiprocessing.Pool(cpu)
-    primer3_runner = partial(subprocess.run,
-                             args=['primer3_core'],
-                             stdout=subprocess.PIPE,
-                             encoding='utf8',
-                             check=False)
+def _run_primer3(primer_template_df, setting_dict):
     results = []
     for primer_name, record in primer_template_df.iterrows():
         # modify setting_dict, prepare primer specific input
@@ -117,27 +110,25 @@ def _run_primer3(primer_template_df, setting_dict, cpu):
                 primer3_input += f'{k}={v}\n'
         primer3_input += '=\n'
         # run
-        result = pool.apply_async(primer3_runner,
-                                  kwds=dict(input=primer3_input))
+        result = subprocess.run(args=['primer3_core'],
+                                input=primer3_input,
+                                stdout=subprocess.PIPE,
+                                encoding='utf8',
+                                check=False)
         results.append(result)
-    pool.close()
-    pool.join()
 
     primer_stats = []
     primers = []
-    for result in results:
-        primer3_return = result.get()
+    for primer3_return in results:
         if primer3_return.returncode != 0:
             print(primer3_return)
             return
-
         primer3_out = primer3_return.stdout
         primer_stat_df, primer_df = _parse_primer3_result(primer3_out)
         primer_stats.append(primer_stat_df)
         primers.append(primer_df)
     total_primer_stat_df = pd.concat(primer_stats, sort=True)
     total_primer_df = pd.concat(primers, sort=True)
-
     return primer_template_df, total_primer_stat_df, total_primer_df
 
 
@@ -247,12 +238,14 @@ def blast_primer(primer_fasta_path,
                                         evalue=evalue_cutoff,
                                         outfmt=5,
                                         word_size=word_size,
-                                        out=str(temp_dir / "primer_blast_result.xml"),
+                                        out=str(temp_dir / (primer_fasta_path.stem +
+                                                            "_blast_result.xml")),
                                         task='blastn')
     blast_cline()
 
     # parse blast result
-    blast_results = SearchIO.parse(temp_dir / "primer_blast_result.xml", "blast-xml")
+    blast_results = SearchIO.parse(temp_dir / (primer_fasta_path.stem +
+                                               "_blast_result.xml"), "blast-xml")
     primer_hit_dict = {}
     for blast_result in blast_results:
         primer_length = blast_result.seq_len
@@ -314,7 +307,7 @@ def blast_primer(primer_fasta_path,
 
 def primer_blast(bed_path, target_fasta_path, primer3_setting_path, blast_db_path,
                  left_expand=None, right_expand=None, both_expand=100,
-                 max_length=99999, drop_too_long=False, cpu=10, blast_kws=None,
+                 max_length=99999, drop_too_long=False, blast_kws=None,
                  **config_kws):
     out_dir = pathlib.Path(bed_path).parent
 
@@ -371,13 +364,15 @@ def primer_blast(bed_path, target_fasta_path, primer3_setting_path, blast_db_pat
         primer_records.append(primer_series)
     primer_template_df = pd.DataFrame(primer_records).set_index('SEQUENCE_NAME')
     primer_template_df, total_primer_stat_df, total_primer_df = _run_primer3(primer_template_df,
-                                                                             setting_dict, cpu=cpu)
-
-    _dump_primer_fasta(total_primer_df, out_dir / 'primer.fa')
+                                                                             setting_dict)
+    # in case no primer can be designed, total_primer_df is empty:
+    if total_primer_df.shape[0] == 0:
+        return primer_template_df, total_primer_stat_df, None
+    _dump_primer_fasta(total_primer_df, out_dir / (pathlib.Path(bed_path).stem + '_primer.fa'))
 
     if blast_kws is None:
         blast_kws = {}
-    primer_hit_df = blast_primer(primer_fasta_path=out_dir / 'primer.fa',
+    primer_hit_df = blast_primer(primer_fasta_path=out_dir / (pathlib.Path(bed_path).stem + '_primer.fa'),
                                  db_path=blast_db_path,
                                  **blast_kws)
     total_primer_df = pd.concat([total_primer_df, primer_hit_df], axis=1, sort=True)
@@ -394,8 +389,11 @@ def primer_blast(bed_path, target_fasta_path, primer3_setting_path, blast_db_pat
     total_primer_df['Selected'] = total_primer_df.index.map(
         lambda i: True if i in set(selected_primer) else False)
 
-    primer_template_df.to_csv(out_dir / 'primer_template.tsv.gz', sep='\t', compression='gzip')
-    total_primer_stat_df.to_csv(out_dir / 'primer3_stat.tsv.gz', sep='\t', compression='gzip')
-    total_primer_df.to_csv(out_dir / 'primer.tsv.gz', sep='\t', compression='gzip')
-    subprocess.run(['rm', str(out_dir / 'primer_blast_result.xml')])
-    return primer_template_df, total_primer_stat_df, total_primer_df, selected_primer
+    primer_template_df.to_csv(out_dir / (pathlib.Path(bed_path).stem + '_primer_template.tsv.gz'),
+                              sep='\t', compression='gzip')
+    total_primer_stat_df.to_csv(out_dir / (pathlib.Path(bed_path).stem + '_primer3_stat.tsv.gz'),
+                                sep='\t', compression='gzip')
+    total_primer_df.to_csv(out_dir / (pathlib.Path(bed_path).stem + '_primer.tsv.gz'),
+                           sep='\t', compression='gzip')
+    subprocess.run(['rm', str(out_dir / (pathlib.Path(bed_path).stem + '_primer_blast_result.xml'))])
+    return primer_template_df, total_primer_stat_df, total_primer_df
