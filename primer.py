@@ -21,9 +21,9 @@ from Bio import SearchIO
 
 def _read_bed(file_path):
     bed_df = pd.read_table(file_path,
-                           index_col='region_id', header=None, comment='#',
+                           header=None, comment='#',
                            names=['seq_name', 'start', 'end', 'region_id'])
-    return bed_df
+    return bed_df.set_index('region_id')
 
 
 def _read_fasta_fai(fai_path):
