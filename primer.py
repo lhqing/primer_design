@@ -47,10 +47,15 @@ def _query_genome(fasta_path, fai_df,
 
     # calculate length
     seq_start_pos = fai_df.loc[seq_name, 'start_at']
+    line_seq_length = fai_df.loc[seq_name, 'line_seq_length']
+    line_total_length = fai_df.loc[seq_name, 'line_total_length']
+    real_region_start_post = max(0, region_start - left_expand)
+    chrom_query_start = seq_start_pos + real_region_start_post // line_seq_length * line_total_length + \
+                        real_region_start_post % line_seq_length
+
     # in case the region start is close to ref sequence start
-    chrom_query_start = max(0, seq_start_pos + region_start - left_expand)
-    if chrom_query_start == 0:
-        real_left_expand = seq_start_pos
+    if real_region_start_post == 0:
+        real_left_expand = region_start
     else:
         real_left_expand = left_expand
     chrom_query_length = real_left_expand + (region_end - region_start) + right_expand
