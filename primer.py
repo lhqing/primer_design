@@ -186,10 +186,13 @@ def _parse_primer3_result(primer3_out):
 def _judge_potential_products(total_primer_df, products_cutoff=1, ratio=2):
     valid_dict = {}
     for primer, row in total_primer_df.iterrows():
-        potential_products = map(int, row['POTENTIAL_PRODUCT_LENGTHS'].split('|'))
-        max_length = min(int(row['PRIMER_PAIR_PRODUCT_SIZE']) * ratio, 20000)
-        valid_count = sum([i < max_length for i in potential_products])
-        valid_dict[primer] = valid_count <= products_cutoff
+        if row['POTENTIAL_PRODUCT_LENGTHS'] == '':
+            valid_dict[primer] = False
+        else:
+            potential_products = map(int, row['POTENTIAL_PRODUCT_LENGTHS'].split('|'))
+            max_length = min(int(row['PRIMER_PAIR_PRODUCT_SIZE']) * ratio, 20000)
+            valid_count = sum([i < max_length for i in potential_products])
+            valid_dict[primer] = valid_count <= products_cutoff
     products_judge = pd.Series(valid_dict)
     return products_judge
 
