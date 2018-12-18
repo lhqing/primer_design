@@ -7,3 +7,6 @@
 ## Why? 
 
 Include PCRability into consideration when filter potential regions.
+
+## Flowchart
+![flowchart](/primer_design.svg)
