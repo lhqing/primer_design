@@ -19,6 +19,9 @@ from Bio import SearchIO
 
 
 def _read_bed(file_path):
+    """
+    Read a bed file, 4 columns: ['seq_name', 'start', 'end', 'region_id']
+    """
     bed_df = pd.read_table(file_path,
                            header=None, comment='#',
                            names=['seq_name', 'start', 'end', 'region_id'])
@@ -26,7 +29,7 @@ def _read_bed(file_path):
 
 
 def _read_fasta_fai(fai_path):
-    # read samtools faidx format
+    """read samtools faidx for the genome fasta"""
     fai_df = pd.read_table(fai_path,
                            index_col=0, header=None,
                            names=['seq_name', 'length', 'start_at',
@@ -37,6 +40,36 @@ def _read_fasta_fai(fai_path):
 def _query_genome(fasta_path, fai_df,
                   seq_name, region_start, region_end,
                   left_expand, right_expand, primer_name):
+    """
+    Query the DNA sequence for a region from a fasta file
+
+    Parameters
+    ----------
+    fasta_path
+        path of fasta file
+    fai_df
+        fai dataframe corresponding to fasta
+    seq_name
+        name of the sequence in fasta, equal to chromosome name if using genome
+    region_start
+        0 based start position
+    region_end
+        0 based end position
+    left_expand
+        length of left expanding when query sequence
+    right_expand
+        length of right expanding when query sequence
+    primer_name
+        name of the primer
+
+    Returns
+    -------
+    query_result
+        A series contain primer name, template sequence and target region
+        (coords based on template sequence not based on original fasta)
+
+    """
+
     # check fai, get position
     if seq_name not in fai_df.index:
         raise KeyError(f'{seq_name} not in the faidx file of genome fasta {fasta_path}')
@@ -95,6 +128,9 @@ def _query_genome(fasta_path, fai_df,
 
 
 def _run_primer3(primer_template_df, setting_dict):
+    """
+    Primer 3 single runner
+    """
     results = []
     for primer_name, record in primer_template_df.iterrows():
         # modify setting_dict, prepare primer specific input
@@ -209,29 +245,35 @@ def _dump_primer_fasta(total_primer_df, out_path):
         f.write(primer_fasta)
 
 
-def blast_primer(primer_fasta_path,
-                 db_path,
-                 evalue_cutoff=1000,
-                 min_total_mismatch_portion=0.2,
-                 min_total_mismatch=6,
-                 min_prime_3_mismatch=2,
-                 prime_3_length=5,
-                 alt_pos_cutoff=2000,
-                 max_product_size=5000,
-                 word_size=7):
+def _blast_primer(primer_fasta_path,
+                  db_path,
+                  evalue_cutoff=1000,
+                  min_total_mismatch_portion=0.2,
+                  min_total_mismatch=6,
+                  min_prime_3_mismatch=2,
+                  prime_3_length=5,
+                  alt_pos_cutoff=2000,
+                  max_product_size=5000,
+                  word_size=7):
     """
     Take a fasta file as input, query genome db and count qualified hits
-    :param max_product_size:
-    :param word_size:
-    :param alt_pos_cutoff:
-    :param primer_fasta_path:
-    :param db_path:
-    :param evalue_cutoff:
-    :param min_total_mismatch_portion:
-    :param min_total_mismatch:
-    :param min_prime_3_mismatch:
-    :param prime_3_length:
-    :return:
+
+    Parameters
+    ----------
+    primer_fasta_path
+    db_path
+    evalue_cutoff
+    min_total_mismatch_portion
+    min_total_mismatch
+    min_prime_3_mismatch
+    prime_3_length
+    alt_pos_cutoff
+    max_product_size
+    word_size
+
+    Returns
+    -------
+
     """
     # run blastn for all primers
     temp_dir = pathlib.Path(primer_fasta_path).parent
@@ -312,6 +354,29 @@ def primer_blast(bed_path, target_fasta_path, primer3_setting_path, blast_db_pat
                  left_expand=None, right_expand=None, both_expand=100,
                  max_length=99999, drop_too_long=False, blast_kws=None,
                  **config_kws):
+    """
+    Main function, mimic NCBI primer-blast, take a bed file as input,
+    query genome and get DNA sequence for regions listed in the bed,
+    use primer3 to design primer and use blast to check primer specificity.
+
+    Parameters
+    ----------
+    bed_path
+    target_fasta_path
+    primer3_setting_path
+    blast_db_path
+    left_expand
+    right_expand
+    both_expand
+    max_length
+    drop_too_long
+    blast_kws
+    config_kws
+
+    Returns
+    -------
+
+    """
     out_dir = pathlib.Path(bed_path).parent
 
     # parse config
@@ -375,9 +440,9 @@ def primer_blast(bed_path, target_fasta_path, primer3_setting_path, blast_db_pat
 
     if blast_kws is None:
         blast_kws = {}
-    primer_hit_df = blast_primer(primer_fasta_path=out_dir / (pathlib.Path(bed_path).stem + '_primer.fa'),
-                                 db_path=blast_db_path,
-                                 **blast_kws)
+    primer_hit_df = _blast_primer(primer_fasta_path=out_dir / (pathlib.Path(bed_path).stem + '_primer.fa'),
+                                  db_path=blast_db_path,
+                                  **blast_kws)
     total_primer_df = pd.concat([total_primer_df, primer_hit_df], axis=1, sort=True)
     total_primer_df = total_primer_df.reindex(primer_hit_df.index)
 
